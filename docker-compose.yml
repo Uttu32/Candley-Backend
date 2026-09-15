@@ -1,0 +1,22 @@
+services:
+  backend:
+    build: .
+    ports:
+      - "5000:5000"
+    env_file: .env
+    depends_on:
+      mongo:
+        condition: service_healthy
+  mongo:
+    image: mongo:8
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+volumes:
+  mongo_data:
