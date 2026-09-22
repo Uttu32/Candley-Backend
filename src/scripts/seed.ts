@@ -17,7 +17,7 @@ const seed = async () => {
         name: 'Store administrator',
         email: env.ADMIN_EMAIL.toLowerCase(),
         passwordHash,
-        role: 'SUPER_ADMIN',
+        role: 'ADMIN',
         emailVerified: true,
         status: 'ACTIVE',
       },

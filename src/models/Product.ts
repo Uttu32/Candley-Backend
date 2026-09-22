@@ -1,8 +1,15 @@
 import { Schema, model } from 'mongoose'
 
+// const variantSchema = new Schema({
+//   label: { type: String, required: true },
+//   sku: { type: String, required: true, unique: true },
+//   price: { type: Number, required: true, min: 0 },
+//   stock: { type: Number, required: true, min: 0 },
+// }, { _id: true })
+
 const variantSchema = new Schema({
   label: { type: String, required: true },
-  sku: { type: String, required: true, unique: true },
+  sku: { type: String, required: true, unique: true, sparse: true },
   price: { type: Number, required: true, min: 0 },
   stock: { type: Number, required: true, min: 0 },
 }, { _id: true })
@@ -24,6 +31,7 @@ const productSchema = new Schema({
   stock: { type: Number, required: true, min: 0 },
   tags: [{ type: String, index: true }],
   images: [{ type: String }],
+  thumbnailImage: { type: String, default: '' },
   variants: [variantSchema],
   status: { type: String, enum: ['DRAFT', 'ACTIVE', 'OUT_OF_STOCK', 'ARCHIVED'], default: 'ACTIVE', index: true },
   featured: { type: Boolean, default: false },

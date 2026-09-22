@@ -3,6 +3,7 @@ import { ApiError } from '../utils/api-error.js'
 import { verifyAccessToken } from '../utils/tokens.js'
 
 export const authenticate = (request: Request, _response: Response, next: NextFunction) => {
+  console.log("I am inside the authenticate middleware")
   const token = request.headers.authorization?.startsWith('Bearer ')
     ? request.headers.authorization.slice(7)
     : undefined

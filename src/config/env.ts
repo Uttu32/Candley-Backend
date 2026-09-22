@@ -18,6 +18,9 @@ const envSchema = z.object({
   LOG_LEVEL: z.string().default('info'),
   ADMIN_EMAIL: z.string().email().default('admin@candleyaroma.com'),
   ADMIN_PASSWORD: z.string().min(8).default('CandleyAdmin!123'),
+  CLOUDINARY_CLOUD_NAME: z.string().optional(),
+  CLOUDINARY_API_KEY: z.string().optional(),
+  CLOUDINARY_API_SECRET: z.string().optional(),
 })
 
 export const env = envSchema.parse(process.env)

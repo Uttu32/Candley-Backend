@@ -10,10 +10,11 @@ import { Order } from '../models/Order.js'
 
 const addressSchema = z.object({ name: z.string().min(2), phone: z.string().min(8), addressLine1: z.string().min(3), city: z.string().min(2), state: z.string().min(2), postalCode: z.string().min(4), country: z.string().default('India') })
 const checkoutSchema = z.object({ shippingAddress: addressSchema, paymentMethod: z.enum(['RAZORPAY', 'COD']) })
+const objectIdSchema = z.string().regex(/^[a-f\d]{24}$/i, 'Invalid order identifier')
 export const ordersRouter = Router()
 ordersRouter.use(authenticate)
 ordersRouter.get('/', asyncHandler(async (request, response) => sendSuccess(response, await Order.find({ userId: request.auth!.sub }).sort({ createdAt: -1 }).lean())))
-ordersRouter.get('/:id', asyncHandler(async (request, response) => { const order = await Order.findOne({ _id: request.params.id, userId: request.auth!.sub }).lean(); if (!order) throw new ApiError(404, 'Order not found'); sendSuccess(response, order) }))
+ordersRouter.get('/:id', asyncHandler(async (request, response) => { const id = objectIdSchema.parse(request.params.id); const order = await Order.findOne({ _id: id, userId: request.auth!.sub }).lean(); if (!order) throw new ApiError(404, 'Order not found'); sendSuccess(response, order) }))
 ordersRouter.post('/', asyncHandler(async (request, response) => {
   const input = checkoutSchema.parse(request.body)
   const cart = await Cart.findOne({ userId: request.auth!.sub }).populate('items.productId')

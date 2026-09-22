@@ -1,6 +1,6 @@
 # Frontend-backend contract
 
-The frontend currently uses mock data and local Zustand state. These endpoints are the first integration contract and preserve the existing route behavior without changing the UI shape unnecessarily.
+These endpoints are the integration contract between the React storefront and the Express API.
 
 | Frontend surface | Method | Endpoint | Auth | Request | Response data |
 |---|---|---|---|---|---|
@@ -21,7 +21,8 @@ The frontend currently uses mock data and local Zustand state. These endpoints a
 | Account orders | GET | `/api/v1/orders` | Access token | none | order list |
 | Order detail | GET | `/api/v1/orders/:id` | Access token | none | order |
 | Checkout | POST | `/api/v1/orders` | Access token | `{ shippingAddress, paymentMethod }` | server-calculated order |
-| Service readiness | GET | `/ready` | No | none | Mongo/Redis status |
+| Admin dashboard | GET | `/api/v1/admin/dashboard` | Admin access token | optional `from`, `to` | database-derived dashboard metrics |
+| Service readiness | GET | `/ready` | No | none | MongoDB status |
 
 All responses use `{ success, message, data }` on success and `{ success, message, errors }` on errors. Prices, stock, tax, shipping, discounts, and payment state are server-owned.
 
@@ -29,7 +30,7 @@ All responses use `{ success, message, data }` on success and `{ success, messag
 
 ```text
 React page -> API client -> /api/v1 route -> validation -> service/model -> MongoDB
-                                                        \-> Redis/cache/jobs where appropriate
+                                                        \-> MongoDB and in-process services where appropriate
 ```
 
 ## Known frontend gaps

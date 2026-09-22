@@ -3,7 +3,7 @@
 ## Slice 1: foundation (current)
 
 - API bootstrap, environment validation, security middleware, logging
-- MongoDB and Redis adapters with health/readiness checks
+- MongoDB adapter with health/readiness checks
 - Auth with Argon2, access tokens, HTTP-only rotated refresh tokens
 - Product/category reads, authenticated cart/wishlist, server-calculated COD order creation
 
@@ -25,7 +25,7 @@
 
 ## Slice 4: operations and content
 
-- Admin RBAC APIs, audit logs, inventory adjustments
+- Admin RBAC APIs, dashboard aggregation, audit logs, inventory adjustments
 - Cloudinary/S3 media abstraction
 - Homepage CMS, hero scheduling, settings
 - BullMQ queues/workers for email, inventory expiry, abandoned carts, reports
