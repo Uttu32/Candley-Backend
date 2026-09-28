@@ -23,63 +23,147 @@ ordersRouter.get(
       .lean();
 
     const groupedOrders = orders.map((order) => {
+      type GroupedItem = {
+        productId: (typeof order.items)[number]['productId']
+        productName: string
+        sku: string
+        image: string
+        unitPrice: number
+        quantity: number
+        lineTotal: number
+      }
+
       const groupedItems = Object.values(
-        order.items.reduce(
-          (acc, item) => {
-            const productId = item?.productId?.toString();
+        order.items.reduce<Record<string, GroupedItem>>((acc, item) => {
+          const productId = item.productId?.toString()
 
-            if (!acc[productId]) {
-              acc[productId] = {
-                productId: item.productId,
-                productName: item.productName,
-                sku: item.sku,
-                image: item.image,
+          if (!productId) {
+            return acc
+          }
 
-                // Historical price at the time of purchase
-                unitPrice: item.unitPrice,
-
-                quantity: item.quantity,
-                lineTotal: item.lineTotal,
-              };
-            } else {
-              acc[productId].quantity += item.quantity;
-              acc[productId].lineTotal += item.lineTotal;
+          if (!acc[productId]) {
+            acc[productId] = {
+              productId: item.productId ,
+              productName: item.productName ?? "",
+              sku: item.sku ?? "",
+              image: item.image ?? "",
+              unitPrice: item.unitPrice ?? 0,
+              quantity: item.quantity ?? 0,
+              lineTotal: item.lineTotal ?? 0,
             }
+          } else {
+            acc[productId].quantity += item.quantity ?? 0
+            acc[productId].lineTotal += item.lineTotal ?? 0
+          }
 
-            return acc;
-          },
-          {} as Record<
-            string,
-            {
-              productId: (typeof order.items)[number]['productId'];
-              productName: string;
-              sku: string;
-              image: string;
-              unitPrice: number;
-              quantity: number;
-              lineTotal: number;
-            }
-          >
-        )
-      );
+          return acc
+        }, {})
+      )
 
       return {
         ...order,
         items: groupedItems,
-      };
-    });
+      }
+    })
 
-    return sendSuccess(response, groupedOrders);
+    return sendSuccess(response, groupedOrders)
   })
-);
-ordersRouter.get('/:id', asyncHandler(async (request, response) => { const id = objectIdSchema.parse(request.params.id); const order = await Order.findOne({ _id: id, userId: request.auth!.sub }).lean(); if (!order) throw new ApiError(404, 'Order not found'); sendSuccess(response, order) }))
-ordersRouter.post('/', asyncHandler(async (request, response) => {
-  const input = checkoutSchema.parse(request.body)
-  const cart = await Cart.findOne({ userId: request.auth!.sub }).populate('items.productId')
-  if (!cart?.items.length) throw new ApiError(422, 'Cart is empty')
-  const items = cart.items.map((item) => { const product = item.productId as unknown as { _id: string; name: string; sku: string; price: number; images: string[]; stock: number }; if (product.stock < item.quantity) throw new ApiError(409, `Insufficient stock for ${product.name}`); return { productId: product._id, productName: product.name, sku: product.sku, image: product.images[0], unitPrice: product.price, quantity: item.quantity, lineTotal: product.price * item.quantity } })
-  const subtotal = items.reduce((sum, item) => sum + item.lineTotal, 0)
-  const order = await Order.create({ orderNumber: `CAN-${new Date().getFullYear()}-${randomInt(100000, 999999)}`, userId: request.auth!.sub, items, shippingAddress: input.shippingAddress, subtotal, shipping: subtotal >= 999 ? 0 : 99, tax: 0, total: subtotal + (subtotal >= 999 ? 0 : 99), paymentMethod: input.paymentMethod, status: input.paymentMethod === 'COD' ? 'CONFIRMED' : 'PENDING_PAYMENT' })
-  if (input.paymentMethod === 'COD') await Cart.updateOne({ userId: request.auth!.sub }, { $set: { items: [] } })
-  sendSuccess(response, order, 'Checkout order created', 201)
-}))
+)
+
+ordersRouter.get(
+  '/:id',
+  asyncHandler(async (request, response) => {
+    const id = objectIdSchema.parse(request.params.id)
+
+    const order = await Order.findOne({
+      _id: id,
+      userId: request.auth!.sub,
+    }).lean()
+
+    if (!order) {
+      throw new ApiError(404, 'Order not found')
+    }
+
+    sendSuccess(response, order)
+  })
+)
+
+ordersRouter.post(
+  '/',
+  asyncHandler(async (request, response) => {
+    const input = checkoutSchema.parse(request.body)
+
+    const cart = await Cart.findOne({
+      userId: request.auth!.sub,
+    }).populate('items.productId')
+
+    if (!cart?.items.length) {
+      throw new ApiError(422, 'Cart is empty')
+    }
+
+    const items = cart.items.map((item) => {
+      const product = item.productId as unknown as {
+        _id: string
+        name: string
+        sku: string
+        price: number
+        images: string[]
+        stock: number
+      }
+
+      if (product.stock < item.quantity) {
+        throw new ApiError(
+          409,
+          `Insufficient stock for ${product.name}`
+        )
+      }
+
+      return {
+        productId: product._id,
+        productName: product.name,
+        sku: product.sku,
+        image: product.images[0],
+        unitPrice: product.price,
+        quantity: item.quantity,
+        lineTotal: product.price * item.quantity,
+      }
+    })
+
+    const subtotal = items.reduce(
+      (sum, item) => sum + item.lineTotal,
+      0
+    )
+
+    const shipping = subtotal >= 999 ? 0 : 99
+
+    const order = await Order.create({
+      orderNumber: `CAN-${new Date().getFullYear()}-${randomInt(100000, 999999)}`,
+      userId: request.auth!.sub,
+      items,
+      shippingAddress: input.shippingAddress,
+      subtotal,
+      shipping,
+      tax: 0,
+      total: subtotal + shipping,
+      paymentMethod: input.paymentMethod,
+      status:
+        input.paymentMethod === 'COD'
+          ? 'CONFIRMED'
+          : 'PENDING_PAYMENT',
+    })
+
+    if (input.paymentMethod === 'COD') {
+      await Cart.updateOne(
+        { userId: request.auth!.sub },
+        { $set: { items: [] } }
+      )
+    }
+
+    sendSuccess(
+      response,
+      order,
+      'Checkout order created',
+      201
+    )
+  })
+)
