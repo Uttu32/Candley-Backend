@@ -125,7 +125,7 @@ adminRouter.get('/dashboard', authenticate, requireRole('ADMIN', 'SUPER_ADMIN'),
       { $group: { _id: null, total: { $sum: '$total' } } },
     ]),
     Order.countDocuments(dateMatch),
-    UserModel.countDocuments({ status: 'ACTIVE' }),
+    UserModel.countDocuments({ status: 'ACTIVE', role: 'CUSTOMER' }),
     Order.countDocuments({ ...dateMatch, status: { $in: ['PENDING_PAYMENT', 'CONFIRMED', 'PROCESSING'] } }),
     Product.countDocuments({ status: { $ne: 'ARCHIVED' } }),
     Product.countDocuments({ status: { $ne: 'ARCHIVED' }, stock: 0 }),
@@ -136,6 +136,7 @@ adminRouter.get('/dashboard', authenticate, requireRole('ADMIN', 'SUPER_ADMIN'),
       { $project: { _id: 0, label: '$_id', value: 1 } },
     ]),
   ])
+  console.log(Product.countDocuments({ status: { $ne: 'ARCHIVED' }, stock: 0 })), "product count";
 
   const totalSales = sales[0]?.total ?? 0
   sendSuccess(response, {
@@ -160,23 +161,48 @@ adminRouter.get('/products', authenticate, requireRole('ADMIN', 'SUPER_ADMIN'), 
   sendSuccess(response, { items, pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } })
 }))
 
-adminRouter.post('/products', authenticate, requireRole('ADMIN', 'SUPER_ADMIN'), imageUpload.array('images', 12), asyncHandler(async (request, response) => {
-  console.log("I am inside the post products route")
-  const input = getProductPayload(request.body as Record<string, unknown>)
-  const files = (request.files as Express.Multer.File[] | undefined) ?? []
-  const uploaded = await Promise.all(files.map((file) => uploadImage(file.buffer, 'candley-aroma/products')))
-  const thumbnailIndex = Math.max(Number(request.body.thumbnailIndex) || 0, 0)
-  const images = uploaded.map((image) => image.secure_url)
-  let product: any = null
-  try {
-    product = await Product.create({ ...input, images, thumbnailImage: images[thumbnailIndex] ?? images[0] ?? '' })
-    
-  } catch (error) {
-    console.log(error, 'this is error')
-  }
-  console.log(product, 'this is product')
-  sendSuccess(response, product, 'Product created', 201)
-}))
+adminRouter.post(
+  '/products',
+  authenticate,
+  requireRole('ADMIN', 'SUPER_ADMIN'),
+  imageUpload.array('images', 12),
+  asyncHandler(async (request, response) => {
+    console.log('I am inside the post products route')
+
+    const input = getProductPayload(
+      request.body as Record<string, unknown>
+    )
+
+    const files =
+      (request.files as Express.Multer.File[] | undefined) ?? []
+
+    const uploaded = await Promise.all(
+      files.map((file) =>
+        uploadImage(file.buffer, 'candley-aroma/products')
+      )
+    )
+
+    const images = uploaded.map((image) => image.secure_url)
+
+    // First uploaded image is always the thumbnail
+    const thumbnailImage = images[0] ?? ''
+
+    try {
+      const product = await Product.create({
+        ...input,
+        images,
+        thumbnailImage,
+      })
+
+      console.log(product, 'this is product')
+
+      sendSuccess(response, product, 'Product created', 201)
+    } catch (error) {
+      console.error(error, 'this is error')
+      throw error
+    }
+  })
+)
 
 adminRouter.patch('/products/:id', authenticate, requireRole('ADMIN', 'SUPER_ADMIN'), imageUpload.array('images', 12), asyncHandler(async (request, response) => {
   const id = objectIdSchema.parse(request.params.id)

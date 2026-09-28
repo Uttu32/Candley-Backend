@@ -13,7 +13,65 @@ const checkoutSchema = z.object({ shippingAddress: addressSchema, paymentMethod:
 const objectIdSchema = z.string().regex(/^[a-f\d]{24}$/i, 'Invalid order identifier')
 export const ordersRouter = Router()
 ordersRouter.use(authenticate)
-ordersRouter.get('/', asyncHandler(async (request, response) => sendSuccess(response, await Order.find({ userId: request.auth!.sub }).sort({ createdAt: -1 }).lean())))
+ordersRouter.get(
+  '/',
+  asyncHandler(async (request, response) => {
+    const orders = await Order.find({
+      userId: request.auth!.sub,
+    })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const groupedOrders = orders.map((order) => {
+      const groupedItems = Object.values(
+        order.items.reduce(
+          (acc, item) => {
+            const productId = item?.productId?.toString();
+
+            if (!acc[productId]) {
+              acc[productId] = {
+                productId: item.productId,
+                productName: item.productName,
+                sku: item.sku,
+                image: item.image,
+
+                // Historical price at the time of purchase
+                unitPrice: item.unitPrice,
+
+                quantity: item.quantity,
+                lineTotal: item.lineTotal,
+              };
+            } else {
+              acc[productId].quantity += item.quantity;
+              acc[productId].lineTotal += item.lineTotal;
+            }
+
+            return acc;
+          },
+          {} as Record<
+            string,
+            {
+              productId: (typeof order.items)[number]['productId'];
+              productName: string;
+              sku: string;
+              image: string;
+              unitPrice: number;
+              quantity: number;
+              lineTotal: number;
+            }
+          >
+        )
+      );
+
+      return {
+        ...order,
+        items: groupedItems,
+      };
+    });
+
+    return sendSuccess(response, groupedOrders);
+  })
+);
 ordersRouter.get('/:id', asyncHandler(async (request, response) => { const id = objectIdSchema.parse(request.params.id); const order = await Order.findOne({ _id: id, userId: request.auth!.sub }).lean(); if (!order) throw new ApiError(404, 'Order not found'); sendSuccess(response, order) }))
 ordersRouter.post('/', asyncHandler(async (request, response) => {
   const input = checkoutSchema.parse(request.body)

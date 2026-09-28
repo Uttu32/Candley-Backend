@@ -11,7 +11,48 @@ const itemSchema = z.object({ productId: z.string().min(1), variantId: z.string(
 const objectIdSchema = z.string().regex(/^[a-f\d]{24}$/i, 'Invalid product identifier')
 export const cartRouter = Router()
 cartRouter.use(authenticate)
-cartRouter.get('/', asyncHandler(async (request, response) => sendSuccess(response, await Cart.findOne({ userId: request.auth!.sub }).populate('items.productId').lean() ?? { userId: request.auth!.sub, items: [] })))
+
+cartRouter.get(
+  '/',
+  asyncHandler(async (request, response) => {
+    const cart =
+      await Cart.findOne({ userId: request.auth!.sub })
+        .populate('items.productId')
+        .lean();
+
+    if (!cart) {
+      return sendSuccess(response, {
+        userId: request.auth!.sub,
+        items: [],
+      });
+    }
+
+    const groupedItems = Object.values(
+      cart.items.reduce((acc, item) => {
+        const productId: any = item.productId?._id?.toString();
+
+        if (!productId) return acc;
+
+        if (!acc[productId]) {
+          acc[productId] = {
+            ...item,
+            quantity: item.quantity,
+          };
+        } else {
+          acc[productId].quantity += item.quantity;
+        }
+
+        return acc;
+      }, {} as Record<string, (typeof cart.items)[number]>)
+    );
+
+    return sendSuccess(response, {
+      ...cart,
+      items: groupedItems,
+    });
+  })
+);
+
 cartRouter.post('/items', asyncHandler(async (request, response) => {
   const input = itemSchema.parse(request.body)
   const productId = objectIdSchema.parse(input.productId)
