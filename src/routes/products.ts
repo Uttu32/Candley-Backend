@@ -37,6 +37,8 @@ const limitSchema = z.object({ limit: z.coerce.number().int().positive().max(24)
  */
 const nameMatcher = (value: string) => new RegExp(escapeRegex(value.replaceAll('-', ' ')), 'i')
 
+const searchFields = ['name', 'fragrance', 'collection', 'category', 'tags', 'sku'] as const
+
 export const productsRouter = Router()
 
 productsRouter.get('/', asyncHandler(async (request, response) => {
@@ -49,7 +51,14 @@ productsRouter.get('/', asyncHandler(async (request, response) => {
   }
   if (query.featured) filter.featured = query.featured === 'true'
   if (query.inStock === 'true') { filter.stock = { $gt: 0 }; filter.status = 'ACTIVE' }
-  if (query.q) filter.$text = { $search: query.q }
+  if (query.q) {
+    // Partial, case-insensitive match so live search finds "Amber" from "am". Every word must match some field.
+    const words = query.q.split(/\s+/).filter(Boolean).slice(0, 6)
+    filter.$and = words.map((word) => {
+      const pattern = new RegExp(String.raw`(^|\W)` + escapeRegex(word), 'i')
+      return { $or: searchFields.map((field) => ({ [field]: pattern })) }
+    })
+  }
   const [items, total] = await Promise.all([
     Product.find(filter).sort(sortOptions[query.sort]).skip((query.page - 1) * query.limit).limit(query.limit).lean(),
     Product.countDocuments(filter),

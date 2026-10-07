@@ -54,6 +54,11 @@ describe('public catalogue', () => {
     expect(cheap.body.data.items).toHaveLength(1)
     const search = await api().get('/api/v1/products?q=cedar')
     expect(search.body.data.items[0].name).toBe('Cedar Smoke')
+    // Live search matches the start of words, case-insensitively, and every word must match.
+    expect((await api().get('/api/v1/products?q=CED')).body.data.items.map((item: { name: string }) => item.name)).toEqual(['Cedar Smoke'])
+    expect((await api().get('/api/v1/products?q=peo%20mi')).body.data.items.map((item: { name: string }) => item.name)).toEqual(['Peony Mist'])
+    expect((await api().get('/api/v1/products?q=edar')).body.data.items).toHaveLength(0)
+    expect((await api().get('/api/v1/products?q=mist')).body.data.items.map((item: { name: string }) => item.name)).toEqual(['Peony Mist'])
   })
 
   it('treats regex metacharacters and operator objects in filters as plain text', async () => {
