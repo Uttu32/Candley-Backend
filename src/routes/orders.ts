@@ -1,169 +1,97 @@
-import { randomInt } from 'node:crypto'
 import { Router } from 'express'
 import { z } from 'zod'
 import { authenticate } from '../middlewares/auth.js'
+import { checkoutLimiter } from '../middlewares/rate-limit.js'
 import { asyncHandler } from '../utils/async-handler.js'
 import { ApiError } from '../utils/api-error.js'
 import { sendSuccess } from '../utils/response.js'
-import { Cart } from '../models/Cart.js'
+import { objectIdSchema, paginate, paginationSchema } from '../utils/validation.js'
 import { Order } from '../models/Order.js'
+import { addressInputSchema } from './account.js'
+import { cancelOrder, createOrder, markOrderPaid, quoteOrder, startRazorpayPayment } from '../services/order.service.js'
+import { verifyPaymentSignature } from '../services/razorpay.service.js'
 
-const addressSchema = z.object({ name: z.string().min(2), phone: z.string().min(8), addressLine1: z.string().min(3), city: z.string().min(2), state: z.string().min(2), postalCode: z.string().min(4), country: z.string().default('India') })
-const checkoutSchema = z.object({ shippingAddress: addressSchema, paymentMethod: z.enum(['RAZORPAY', 'COD']) })
-const objectIdSchema = z.string().regex(/^[a-f\d]{24}$/i, 'Invalid order identifier')
+const shippingAddressSchema = addressInputSchema.omit({ label: true, isDefault: true })
+const checkoutSchema = z.object({
+  shippingAddress: shippingAddressSchema.optional(),
+  addressId: objectIdSchema.optional(),
+  paymentMethod: z.enum(['RAZORPAY', 'COD']),
+  couponCode: z.string().trim().min(2).max(40).regex(/^[A-Za-z0-9_-]+$/, 'Invalid coupon code').optional(),
+  idempotencyKey: z.string().trim().min(8).max(100).optional(),
+}).refine((value) => value.shippingAddress || value.addressId, { message: 'shippingAddress or addressId is required', path: ['shippingAddress'] })
+const verifySchema = z.object({
+  razorpay_order_id: z.string().min(1).max(100),
+  razorpay_payment_id: z.string().min(1).max(100),
+  razorpay_signature: z.string().regex(/^[a-f\d]{64}$/i, 'Invalid signature'),
+})
+const cancelSchema = z.object({ reason: z.string().trim().max(300).optional() })
+const listQuerySchema = paginationSchema.extend({ limit: z.coerce.number().int().positive().max(50).default(50) })
+
+/** Fields customers see. Internal bookkeeping (fingerprint, idempotency key, coupon id) is not exposed. */
+const customerProjection = '-checkoutFingerprint -idempotencyKey -couponId -inventoryReleased -statusHistory.changedBy'
+
 export const ordersRouter = Router()
 ordersRouter.use(authenticate)
-ordersRouter.get(
-  '/',
-  asyncHandler(async (request, response) => {
-    const orders = await Order.find({
-      userId: request.auth!.sub,
-    })
-      .sort({ createdAt: -1 })
-      .lean();
 
-    const groupedOrders = orders.map((order) => {
-      type GroupedItem = {
-        productId: (typeof order.items)[number]['productId']
-        productName: string
-        sku: string
-        image: string
-        unitPrice: number
-        quantity: number
-        lineTotal: number
-      }
+/** Response stays an array (existing contract); pagination is exposed through headers. */
+ordersRouter.get('/', asyncHandler(async (request, response) => {
+  const { page, limit } = listQuerySchema.parse(request.query)
+  const filter = { userId: request.auth!.sub }
+  const [orders, total] = await Promise.all([
+    Order.find(filter).select(customerProjection).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    Order.countDocuments(filter),
+  ])
+  const pagination = paginate(page, limit, total)
+  response.setHeader('X-Total-Count', String(total))
+  response.setHeader('X-Total-Pages', String(pagination.totalPages))
+  sendSuccess(response, orders)
+}))
 
-      const groupedItems = Object.values(
-        order.items.reduce<Record<string, GroupedItem>>((acc, item) => {
-          const productId = item.productId?.toString()
+/** Server-calculated totals for the current cart (and optional coupon) without creating an order. */
+ordersRouter.post('/quote', asyncHandler(async (request, response) => {
+  const { couponCode } = z.object({ couponCode: z.string().trim().max(40).regex(/^[A-Za-z0-9_-]*$/, 'Invalid coupon code').optional() }).parse(request.body ?? {})
+  sendSuccess(response, await quoteOrder(request.auth!.sub, couponCode || undefined))
+}))
 
-          if (!productId) {
-            return acc
-          }
+ordersRouter.get('/:id', asyncHandler(async (request, response) => {
+  const id = objectIdSchema.parse(request.params.id)
+  const order = await Order.findOne({ _id: id, userId: request.auth!.sub }).select(customerProjection).lean()
+  if (!order) throw new ApiError(404, 'Order not found')
+  sendSuccess(response, order)
+}))
 
-          if (!acc[productId]) {
-            acc[productId] = {
-              productId: item.productId ,
-              productName: item.productName ?? "",
-              sku: item.sku ?? "",
-              image: item.image ?? "",
-              unitPrice: item.unitPrice ?? 0,
-              quantity: item.quantity ?? 0,
-              lineTotal: item.lineTotal ?? 0,
-            }
-          } else {
-            acc[productId].quantity += item.quantity ?? 0
-            acc[productId].lineTotal += item.lineTotal ?? 0
-          }
+ordersRouter.post('/', checkoutLimiter, asyncHandler(async (request, response) => {
+  const input = checkoutSchema.parse(request.body)
+  const headerKey = request.get('Idempotency-Key')
+  const idempotencyKey = input.idempotencyKey ?? (headerKey ? z.string().trim().min(8).max(100).parse(headerKey) : undefined)
+  const { order, created } = await createOrder({ ...input, idempotencyKey, userId: request.auth!.sub })
+  const { checkoutFingerprint: _f, idempotencyKey: _k, couponId: _c, inventoryReleased: _r, ...publicOrder } = order
+  sendSuccess(response, publicOrder, created ? 'Checkout order created' : 'Existing order returned', created ? 201 : 200)
+}))
 
-          return acc
-        }, {})
-      )
+ordersRouter.post('/:id/cancel', asyncHandler(async (request, response) => {
+  const id = objectIdSchema.parse(request.params.id)
+  const { reason } = cancelSchema.parse(request.body ?? {})
+  await cancelOrder(id, { kind: 'customer', userId: request.auth!.sub }, reason ?? 'Cancelled by customer')
+  sendSuccess(response, await Order.findById(id).select(customerProjection).lean(), 'Order cancelled')
+}))
 
-      return {
-        ...order,
-        items: groupedItems,
-      }
-    })
+/** Returns the parameters the storefront needs to open Razorpay Checkout for this order. */
+ordersRouter.post('/:id/payment/razorpay', checkoutLimiter, asyncHandler(async (request, response) => {
+  const id = objectIdSchema.parse(request.params.id)
+  sendSuccess(response, await startRazorpayPayment(request.auth!.sub, id), 'Payment initiated')
+}))
 
-    return sendSuccess(response, groupedOrders)
-  })
-)
-
-ordersRouter.get(
-  '/:id',
-  asyncHandler(async (request, response) => {
-    const id = objectIdSchema.parse(request.params.id)
-
-    const order = await Order.findOne({
-      _id: id,
-      userId: request.auth!.sub,
-    }).lean()
-
-    if (!order) {
-      throw new ApiError(404, 'Order not found')
-    }
-
-    sendSuccess(response, order)
-  })
-)
-
-ordersRouter.post(
-  '/',
-  asyncHandler(async (request, response) => {
-    const input = checkoutSchema.parse(request.body)
-
-    const cart = await Cart.findOne({
-      userId: request.auth!.sub,
-    }).populate('items.productId')
-
-    if (!cart?.items.length) {
-      throw new ApiError(422, 'Cart is empty')
-    }
-
-    const items = cart.items.map((item) => {
-      const product = item.productId as unknown as {
-        _id: string
-        name: string
-        sku: string
-        price: number
-        images: string[]
-        stock: number
-      }
-
-      if (product.stock < item.quantity) {
-        throw new ApiError(
-          409,
-          `Insufficient stock for ${product.name}`
-        )
-      }
-
-      return {
-        productId: product._id,
-        productName: product.name,
-        sku: product.sku,
-        image: product.images[0],
-        unitPrice: product.price,
-        quantity: item.quantity,
-        lineTotal: product.price * item.quantity,
-      }
-    })
-
-    const subtotal = items.reduce(
-      (sum, item) => sum + item.lineTotal,
-      0
-    )
-
-    const shipping = subtotal >= 999 ? 0 : 99
-
-    const order = await Order.create({
-      orderNumber: `CAN-${new Date().getFullYear()}-${randomInt(100000, 999999)}`,
-      userId: request.auth!.sub,
-      items,
-      shippingAddress: input.shippingAddress,
-      subtotal,
-      shipping,
-      tax: 0,
-      total: subtotal + shipping,
-      paymentMethod: input.paymentMethod,
-      status:
-        input.paymentMethod === 'COD'
-          ? 'CONFIRMED'
-          : 'PENDING_PAYMENT',
-    })
-
-    if (input.paymentMethod === 'COD') {
-      await Cart.updateOne(
-        { userId: request.auth!.sub },
-        { $set: { items: [] } }
-      )
-    }
-
-    sendSuccess(
-      response,
-      order,
-      'Checkout order created',
-      201
-    )
-  })
-)
+/** Verifies the Razorpay Checkout callback. The order is only marked paid after the signature checks out. */
+ordersRouter.post('/:id/payment/razorpay/verify', asyncHandler(async (request, response) => {
+  const id = objectIdSchema.parse(request.params.id)
+  const input = verifySchema.parse(request.body)
+  const order = await Order.findOne({ _id: id, userId: request.auth!.sub }).lean()
+  if (!order) throw new ApiError(404, 'Order not found')
+  if (order.payment?.razorpayOrderId !== input.razorpay_order_id) throw new ApiError(400, 'Payment does not belong to this order', [], 'PAYMENT_MISMATCH')
+  if (!verifyPaymentSignature(input.razorpay_order_id, input.razorpay_payment_id, input.razorpay_signature)) {
+    throw new ApiError(400, 'Payment verification failed', [], 'INVALID_SIGNATURE')
+  }
+  const { order: updated } = await markOrderPaid(input.razorpay_order_id, input.razorpay_payment_id)
+  sendSuccess(response, await Order.findById(updated._id).select(customerProjection).lean(), 'Payment verified')
+}))

@@ -1,77 +1,115 @@
-import { randomUUID } from 'node:crypto'
 import { Router } from 'express'
 import argon2 from 'argon2'
 import { z } from 'zod'
-import { User } from '../models/User.js'
-import { RefreshToken } from '../models/RefreshToken.js'
+import { env } from '../config/env.js'
+import { User, toPublicUser } from '../models/User.js'
 import { asyncHandler } from '../utils/async-handler.js'
 import { ApiError } from '../utils/api-error.js'
 import { sendSuccess } from '../utils/response.js'
-import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../utils/tokens.js'
+import { createOpaqueToken, hashOpaqueToken } from '../utils/tokens.js'
 import { authenticate } from '../middlewares/auth.js'
+import { authLimiter } from '../middlewares/rate-limit.js'
+import { endSession, issueSession, revokeAllSessions, rotateSession, verifyCredentials } from '../services/session.service.js'
+import { mailTemplates, queueMail } from '../services/mailer.js'
 
-const credentialsSchema = z.object({ name: z.string().min(2).max(100).optional(), email: z.string().email(), password: z.string().min(8).max(128) })
-const profileSchema = z.object({ name: z.string().min(2).max(100), email: z.string().email(), phone: z.string().max(30), dateOfBirth: z.string().max(30) })
-const refreshCookie = 'candley_refresh_token'
+const emailSchema = z.string().trim().toLowerCase().email().max(254)
+// Upper bound protects the hashing step from oversized input.
+const passwordSchema = z.string().min(8, 'Password must be at least 8 characters').max(128)
+const registerSchema = z.object({ name: z.string().trim().min(2).max(100), email: emailSchema, password: passwordSchema })
+const loginSchema = z.object({ email: emailSchema, password: z.string().min(1).max(128) })
+const profileSchema = z.object({
+  name: z.string().trim().min(2).max(100),
+  email: emailSchema,
+  phone: z.string().trim().max(30).regex(/^[\d+\-\s()]*$/, 'Invalid phone number').default(''),
+  dateOfBirth: z.string().trim().max(30).default(''),
+})
+const changePasswordSchema = z.object({ currentPassword: z.string().min(1).max(128), newPassword: passwordSchema })
+const forgotPasswordSchema = z.object({ email: emailSchema })
+const resetPasswordSchema = z.object({ token: z.string().regex(/^[a-f\d]{64}$/i, 'Invalid reset token'), password: passwordSchema })
+
+const resetTokenTtlMs = 30 * 60_000
 
 export const authRouter = Router()
+
+authRouter.post('/register', authLimiter, asyncHandler(async (request, response) => {
+  const input = registerSchema.parse(request.body)
+  if (await User.exists({ email: input.email })) throw new ApiError(409, 'An account with this email already exists')
+  // Role is never taken from the request; new accounts are always customers.
+  const user = await User.create({ name: input.name, email: input.email, passwordHash: await argon2.hash(input.password), role: 'CUSTOMER' })
+  sendSuccess(response, toPublicUser(user), 'Account created', 201)
+}))
+
+/** Shared login for customers and administrators. The role in the response comes from the database. */
+authRouter.post('/login', authLimiter, asyncHandler(async (request, response) => {
+  const input = loginSchema.parse(request.body)
+  const user = await verifyCredentials(input.email, input.password)
+  if (!user || user.status !== 'ACTIVE') throw new ApiError(401, 'Invalid email or password', [], 'INVALID_CREDENTIALS')
+  const session = await issueSession(response, user)
+  await User.updateOne({ _id: user.id }, { lastLoginAt: new Date() })
+  sendSuccess(response, session, 'Signed in')
+}))
+
+authRouter.post('/refresh', authLimiter, asyncHandler(async (request, response) => {
+  sendSuccess(response, await rotateSession(request, response), 'Token refreshed')
+}))
+
+authRouter.post('/logout', asyncHandler(async (request, response) => {
+  await endSession(request, response)
+  sendSuccess(response, null, 'Signed out')
+}))
 
 authRouter.get('/me', authenticate, asyncHandler(async (request, response) => {
   const user = await User.findById(request.auth!.sub).lean()
   if (!user) throw new ApiError(404, 'Account not found')
-  sendSuccess(response, { id: user._id, name: user.name, email: user.email, phone: user.phone ?? '', dateOfBirth: user.dateOfBirth ?? '', role: user.role, emailVerified: user.emailVerified })
+  sendSuccess(response, toPublicUser(user))
 }))
 
 authRouter.patch('/me', authenticate, asyncHandler(async (request, response) => {
+  // Only these fields can be changed; role, status and other fields are stripped by the schema.
   const input = profileSchema.parse(request.body)
-  const emailOwner = await User.findOne({ email: input.email.toLowerCase(), _id: { $ne: request.auth!.sub } })
+  const emailOwner = await User.exists({ email: input.email, _id: { $ne: request.auth!.sub } })
   if (emailOwner) throw new ApiError(409, 'That email is already in use')
-  const user = await User.findByIdAndUpdate(request.auth!.sub, { $set: { ...input, email: input.email.toLowerCase() } }, { new: true }).lean()
+  const current = await User.findById(request.auth!.sub).select('email').lean()
+  if (!current) throw new ApiError(404, 'Account not found')
+  const update = { name: input.name, email: input.email, phone: input.phone, dateOfBirth: input.dateOfBirth, ...(current.email !== input.email ? { emailVerified: false } : {}) }
+  const user = await User.findByIdAndUpdate(request.auth!.sub, { $set: update }, { new: true, runValidators: true }).lean()
+  sendSuccess(response, toPublicUser(user!), 'Profile updated')
+}))
+
+authRouter.post('/change-password', authenticate, authLimiter, asyncHandler(async (request, response) => {
+  const input = changePasswordSchema.parse(request.body)
+  const user = await User.findById(request.auth!.sub).select('+passwordHash')
   if (!user) throw new ApiError(404, 'Account not found')
-  sendSuccess(response, { id: user._id, name: user.name, email: user.email, phone: user.phone ?? '', dateOfBirth: user.dateOfBirth ?? '', role: user.role, emailVerified: user.emailVerified }, 'Profile updated')
+  if (!(await argon2.verify(user.passwordHash, input.currentPassword).catch(() => false))) throw new ApiError(400, 'Current password is incorrect', [], 'INVALID_CREDENTIALS')
+  user.passwordHash = await argon2.hash(input.newPassword)
+  await user.save()
+  await revokeAllSessions(user.id)
+  const refreshed = await User.findById(user.id)
+  // Issue a fresh session for this device; every other device must sign in again.
+  sendSuccess(response, await issueSession(response, refreshed!), 'Password changed')
 }))
 
-authRouter.post('/register', asyncHandler(async (request, response) => {
-  const input = credentialsSchema.parse(request.body)
-  if (!input.name) throw new ApiError(422, 'Name is required')
-  const exists = await User.exists({ email: input.email.toLowerCase() })
-  if (exists) throw new ApiError(409, 'An account with this email already exists')
-  const user = await User.create({ name: input.name, email: input.email.toLowerCase(), passwordHash: await argon2.hash(input.password) })
-  sendSuccess(response, { id: user.id, name: user.name, email: user.email }, 'Account created', 201)
+/** Always returns the same response so the endpoint cannot be used to discover registered emails. */
+authRouter.post('/forgot-password', authLimiter, asyncHandler(async (request, response) => {
+  const { email } = forgotPasswordSchema.parse(request.body)
+  const user = await User.findOne({ email, status: 'ACTIVE' })
+  if (user) {
+    const token = createOpaqueToken()
+    await User.updateOne({ _id: user.id }, { $set: { passwordResetTokenHash: hashOpaqueToken(token), passwordResetExpiresAt: new Date(Date.now() + resetTokenTtlMs) } })
+    const link = `${env.CLIENT_URL.replace(/\/$/, '')}/reset-password?token=${token}`
+    queueMail({ to: user.email, ...mailTemplates.passwordReset(user.name, link) })
+  }
+  sendSuccess(response, null, 'If an account exists for that email, a reset link has been sent')
 }))
 
-authRouter.post('/login', asyncHandler(async (request, response) => {
-  const input = credentialsSchema.pick({ email: true, password: true }).parse(request.body)
-  const user = await User.findOne({ email: input.email.toLowerCase() }).select('+passwordHash')
-  if (!user || !(await argon2.verify(user.passwordHash, input.password))) throw new ApiError(401, 'Invalid email or password')
-  if (user.status !== 'ACTIVE') throw new ApiError(403, 'This account is not active')
-  const tokenId = randomUUID()
-  const accessToken = signAccessToken({ sub: user.id, role: user.role })
-  const refreshToken = signRefreshToken({ sub: user.id, jti: tokenId })
-  await RefreshToken.create({ userId: user.id, tokenId, expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) })
-  response.cookie(refreshCookie, refreshToken, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', domain: process.env.COOKIE_DOMAIN || undefined, maxAge: 7 * 24 * 60 * 60 * 1000 })
-  await User.updateOne({ _id: user.id }, { lastLoginAt: new Date() })
-  sendSuccess(response, { accessToken, user: { id: user.id, name: user.name, email: user.email, role: user.role } }, 'Signed in')
-}))
-
-authRouter.post('/refresh', asyncHandler(async (request, response) => {
-  const token = request.cookies?.[refreshCookie]
-  if (!token) throw new ApiError(401, 'Refresh token required')
-  const claims = verifyRefreshToken(token)
-  const stored = await RefreshToken.findOneAndDelete({ tokenId: claims.jti, userId: claims.sub })
-  if (!stored) throw new ApiError(401, 'Refresh token revoked')
-  const user = await User.findById(claims.sub)
-  if (!user || user.status !== 'ACTIVE') throw new ApiError(401, 'Account unavailable')
-  const tokenId = randomUUID()
-  const nextRefreshToken = signRefreshToken({ sub: user.id, jti: tokenId })
-  await RefreshToken.create({ userId: user.id, tokenId, expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) })
-  response.cookie(refreshCookie, nextRefreshToken, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', maxAge: 7 * 24 * 60 * 60 * 1000 })
-  sendSuccess(response, { accessToken: signAccessToken({ sub: user.id, role: user.role }) }, 'Token refreshed')
-}))
-
-authRouter.post('/logout', asyncHandler(async (request, response) => {
-  const token = request.cookies?.[refreshCookie]
-  if (token) { try { const claims = verifyRefreshToken(token); await RefreshToken.deleteOne({ tokenId: claims.jti }) } catch { /* expired token is already unusable */ } }
-  response.clearCookie(refreshCookie)
-  sendSuccess(response, null, 'Signed out')
+authRouter.post('/reset-password', authLimiter, asyncHandler(async (request, response) => {
+  const input = resetPasswordSchema.parse(request.body)
+  const user = await User.findOneAndUpdate(
+    { passwordResetTokenHash: hashOpaqueToken(input.token), passwordResetExpiresAt: { $gt: new Date() }, status: 'ACTIVE' },
+    { $set: { passwordHash: await argon2.hash(input.password) }, $unset: { passwordResetTokenHash: 1, passwordResetExpiresAt: 1 } },
+    { new: true },
+  )
+  if (!user) throw new ApiError(400, 'Reset link is invalid or has expired', [], 'RESET_TOKEN_INVALID')
+  await revokeAllSessions(user.id)
+  sendSuccess(response, null, 'Password has been reset. Please sign in.')
 }))

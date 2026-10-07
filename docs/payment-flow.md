@@ -1,14 +1,16 @@
 # Payment flow
 
-Razorpay is not enabled by the initial COD slice. The production flow must be:
+## Razorpay
 
-1. Validate cart, address, price, stock, coupon, tax, and shipping on the backend.
-2. Reserve inventory atomically with an expiring reservation.
-3. Create a Razorpay order from the backend-calculated amount.
-4. Verify the checkout signature server-side.
-5. Verify webhook signatures and persist event IDs for idempotency.
-6. Reconcile payment state before confirming the order.
-7. Commit inventory deduction and clear the cart in a MongoDB transaction.
-8. Release reservations on payment failure or expiry.
+1. `POST /orders` with `paymentMethod: "RAZORPAY"` prices the server-side cart and validates the coupon and stock. It then reserves stock atomically (in a transaction when available) and creates the order as `PENDING_PAYMENT` with `reservationExpiresAt`.
+2. `POST /orders/:id/payment/razorpay` creates a Razorpay order for the **stored** total (in paise) and returns `keyId` and `razorpayOrderId` for Razorpay Checkout. Repeat calls reuse it.
+3. After Checkout succeeds, the storefront calls `POST /orders/:id/payment/razorpay/verify` with the three `razorpay_*` fields. The server checks that the Razorpay order belongs to this order and verifies `HMAC_SHA256(order_id|payment_id, key_secret)` before marking it `PAID`/`CONFIRMED`.
+4. The webhook (`payment.captured`/`order.paid`/`payment.failed`) is verified against the raw body and processed once per event id. It confirms payments even if the browser never returned.
+5. Every minute, the sweeper cancels unpaid orders past their reservation and returns their stock. It first asks Razorpay whether the order was paid, and confirms it if so.
+6. A payment arriving after an automatic expiry re-reserves stock when possible. A payment for an order that the customer or admin cancelled, or with no stock left, is recorded as `PAID` with a **REFUND REQUIRED** note in `statusHistory`. Refunds are made in the Razorpay dashboard.
 
-The frontend must never mark an order paid from its own callback alone.
+The frontend success callback alone never marks an order paid.
+
+## Cash on delivery
+
+COD is checked server-side against `storesettings.codEnabled` and `codMaxOrderValue`. The order is created `CONFIRMED`/`PENDING`, stock is deducted and the cart cleared. An admin records collection with `POST /admin/orders/:id/cod-collected` once the order is `SHIPPED` or `DELIVERED`.

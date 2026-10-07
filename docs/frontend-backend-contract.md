@@ -24,7 +24,7 @@ These endpoints are the integration contract between the React storefront and th
 | Admin dashboard | GET | `/api/v1/admin/dashboard` | Admin access token | optional `from`, `to` | database-derived dashboard metrics |
 | Service readiness | GET | `/ready` | No | none | MongoDB status |
 
-All responses use `{ success, message, data }` on success and `{ success, message, errors }` on errors. Prices, stock, tax, shipping, discounts, and payment state are server-owned.
+All responses use `{ success, message, data }` on success and `{ success: false, message, error: { code, message, details? } }` on errors. The full endpoint list is in `api-reference.md`. Prices, stock, tax, shipping, discounts, and payment state are server-owned.
 
 ## Integration flow
 
@@ -35,7 +35,9 @@ React page -> API client -> /api/v1 route -> validation -> service/model -> Mong
 
 ## Known frontend gaps
 
-- Auth, checkout, and admin forms currently render inputs but do not submit.
-- Cart and wishlist currently use local Zustand state and mock products.
-- Razorpay is not yet wired in the frontend.
-- Account orders and admin metrics/products are currently placeholders.
+- Razorpay Checkout is not wired: call `POST /orders/:id/payment/razorpay`, open Checkout, then `POST /orders/:id/payment/razorpay/verify`.
+- `AdminProductsPage` re-sends variants without `_id` and with an empty `sku`. The backend now preserves variant IDs and SKUs by label, but the form should send `_id` and `sku`.
+- `removeFromCart`/`updateQuantity` in `useAppStore` do not send `variantId`. Pass it (query or body) so multi-variant lines are targeted precisely.
+- Admin orders, customers, coupons and settings pages are placeholders; their APIs now exist.
+- Forgot/reset-password, saved addresses and order cancellation have APIs but no UI yet.
+- The store still keeps a local cart/wishlist for guests. Guest items are never written to another account; they are only sent while a user is signed in.
