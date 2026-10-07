@@ -76,57 +76,171 @@ adminRouter.get('/me', asyncHandler(async (request, response) => {
   sendSuccess(response, toPublicUser(user))
 }))
 
+const DAY_MS = 86_400_000
+const IST_OFFSET_MS = 330 * 60_000
+const istDayKey = (date: Date) => new Date(date.getTime() + IST_OFFSET_MS).toISOString().slice(0, 10)
+
+/** Every IST day (YYYY-MM-DD) or month (YYYY-MM) between two dates, so charts show quiet periods as zero. */
+const periodKeys = (from: Date, to: Date, unit: 'day' | 'month') => {
+  const keys: string[] = []
+  const last = unit === 'day' ? istDayKey(to) : istDayKey(to).slice(0, 7)
+  if (unit === 'day') {
+    for (let time = from.getTime(); istDayKey(new Date(time)) <= last; time += DAY_MS) keys.push(istDayKey(new Date(time)))
+    return keys
+  }
+  let [year, month] = istDayKey(from).split('-').map(Number)
+  for (let key = `${year}-${String(month).padStart(2, '0')}`; key <= last; key = `${year}-${String(month).padStart(2, '0')}`) {
+    keys.push(key)
+    month += 1
+    if (month > 12) { month = 1; year += 1 }
+  }
+  return keys
+}
+
+const average = (total: number, count: number) => (count ? Math.round((total / count) * 100) / 100 : 0)
+
+/** Paid sales, booked (non-cancelled) value and order/customer counts for one window. */
+const periodTotals = async (from: Date, to: Date) => {
+  const dateMatch = { createdAt: { $gte: from, $lte: to } }
+  const isPaid = { $eq: ['$paymentStatus', 'PAID'] }
+  const isLive = { $ne: ['$status', 'CANCELLED'] }
+  const [totals, newCustomers] = await Promise.all([
+    Order.aggregate<{ totalSales: number; paidOrders: number; bookedSales: number; bookedOrders: number; totalOrders: number }>([
+      { $match: dateMatch },
+      { $group: {
+        _id: null,
+        totalOrders: { $sum: 1 },
+        totalSales: { $sum: { $cond: [isPaid, '$total', 0] } },
+        paidOrders: { $sum: { $cond: [isPaid, 1, 0] } },
+        bookedSales: { $sum: { $cond: [isLive, '$total', 0] } },
+        bookedOrders: { $sum: { $cond: [isLive, 1, 0] } },
+      } },
+    ]),
+    User.countDocuments({ role: 'CUSTOMER', ...dateMatch }),
+  ])
+  const row = totals[0] ?? { totalSales: 0, paidOrders: 0, bookedSales: 0, bookedOrders: 0, totalOrders: 0 }
+  return {
+    totalSales: row.totalSales,
+    paidOrders: row.paidOrders,
+    totalOrders: row.totalOrders,
+    bookedSales: row.bookedSales,
+    bookedOrders: row.bookedOrders,
+    newCustomers,
+    // Average over paid orders, since only paid orders contribute to sales.
+    averageOrderValue: average(row.totalSales, row.paidOrders),
+    bookedAverageOrderValue: average(row.bookedSales, row.bookedOrders),
+  }
+}
+
 /** All figures are computed from stored orders, users and products. */
 adminRouter.get('/dashboard', asyncHandler(async (request, response) => {
   const { from, to = new Date(), lowStockThreshold } = dashboardQuerySchema.parse(request.query)
   if (from > to) throw new ApiError(400, 'Invalid dashboard date range')
+  const hasRange = request.query.from !== undefined
+  const span = to.getTime() - from.getTime()
+  // Short ranges chart by day; long ranges and "all time" chart by month.
+  const unit: 'day' | 'month' = hasRange && span <= 120 * DAY_MS ? 'day' : 'month'
   const dateMatch = { createdAt: { $gte: from, $lte: to } }
-  const [sales, totalOrders, totalCustomers, newCustomers, pendingOrders, totalProducts, outOfStockProducts, lowStockProducts, revenueSeries, topProducts, ordersByStatus] = await Promise.all([
-    Order.aggregate<{ total: number; count: number }>([
-      { $match: { ...dateMatch, paymentStatus: 'PAID' } },
-      { $group: { _id: null, total: { $sum: '$total' }, count: { $sum: 1 } } },
-    ]),
-    Order.countDocuments(dateMatch),
+  const liveProducts = { status: { $ne: 'ARCHIVED' as const } }
+
+  const [current, previous, totalCustomers, pendingOrders, totalProducts, outOfStockProducts, lowStockProducts, series, topProducts, ordersByStatus, paymentMethods, recentOrders, lowStockItems, attention] = await Promise.all([
+    periodTotals(from, to),
+    // The equally long window just before this one, for trend comparisons.
+    hasRange ? periodTotals(new Date(from.getTime() - span), new Date(from.getTime() - 1)) : Promise.resolve(null),
     User.countDocuments({ status: 'ACTIVE', role: 'CUSTOMER' }),
-    User.countDocuments({ role: 'CUSTOMER', ...dateMatch }),
     Order.countDocuments({ ...dateMatch, status: { $in: ['PENDING_PAYMENT', 'CONFIRMED', 'PROCESSING'] } }),
-    Product.countDocuments({ status: { $ne: 'ARCHIVED' } }),
-    Product.countDocuments({ status: { $ne: 'ARCHIVED' }, stock: 0 }),
-    Product.countDocuments({ status: { $ne: 'ARCHIVED' }, stock: { $gt: 0, $lte: lowStockThreshold } }),
-    Order.aggregate([
-      { $match: { ...dateMatch, paymentStatus: 'PAID' } },
-      { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'Asia/Kolkata' } }, value: { $sum: '$total' } } },
+    Product.countDocuments(liveProducts),
+    Product.countDocuments({ ...liveProducts, stock: 0 }),
+    Product.countDocuments({ ...liveProducts, stock: { $gt: 0, $lte: lowStockThreshold } }),
+    Order.aggregate<{ label: string; value: number; booked: number; orders: number }>([
+      { $match: { ...dateMatch, status: { $ne: 'CANCELLED' } } },
+      { $group: {
+        _id: { $dateToString: { format: unit === 'day' ? '%Y-%m-%d' : '%Y-%m', date: '$createdAt', timezone: 'Asia/Kolkata' } },
+        value: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'PAID'] }, '$total', 0] } },
+        booked: { $sum: '$total' },
+        orders: { $sum: 1 },
+      } },
       { $sort: { _id: 1 } },
-      { $project: { _id: 0, label: '$_id', value: 1 } },
+      { $project: { _id: 0, label: '$_id', value: 1, booked: 1, orders: 1 } },
     ]),
     Order.aggregate([
       { $match: { ...dateMatch, status: { $ne: 'CANCELLED' } } },
       { $unwind: '$items' },
-      { $group: { _id: '$items.productId', name: { $last: '$items.productName' }, units: { $sum: '$items.quantity' }, revenue: { $sum: '$items.lineTotal' } } },
+      { $group: {
+        _id: '$items.productId',
+        name: { $last: '$items.productName' },
+        image: { $last: { $cond: [{ $gt: [{ $strLenCP: { $ifNull: ['$items.thumbnailImage', ''] } }, 0] }, '$items.thumbnailImage', '$items.image'] } },
+        units: { $sum: '$items.quantity' },
+        revenue: { $sum: '$items.lineTotal' },
+      } },
       { $sort: { units: -1, _id: 1 } },
       { $limit: 5 },
-      { $project: { _id: 0, productId: '$_id', name: 1, units: 1, revenue: 1 } },
+      { $project: { _id: 0, productId: '$_id', name: 1, image: 1, units: 1, revenue: 1 } },
     ]),
     Order.aggregate([{ $match: dateMatch }, { $group: { _id: '$status', count: { $sum: 1 } } }, { $project: { _id: 0, status: '$_id', count: 1 } }]),
+    Order.aggregate([
+      { $match: { ...dateMatch, status: { $ne: 'CANCELLED' } } },
+      { $group: { _id: '$paymentMethod', count: { $sum: 1 }, amount: { $sum: '$total' } } },
+      { $sort: { amount: -1 } },
+      { $project: { _id: 0, method: '$_id', count: 1, amount: 1 } },
+    ]),
+    Order.find().sort({ createdAt: -1, _id: -1 }).limit(6)
+      .select('orderNumber shippingAddress.name total status paymentStatus paymentMethod createdAt items.quantity').lean(),
+    Product.find({ ...liveProducts, stock: { $lte: lowStockThreshold } }).sort({ stock: 1, name: 1 }).limit(6)
+      .select('name sku stock thumbnailImage images').lean(),
+    // Current workload, independent of the selected period.
+    Order.aggregate<{ awaitingPayment: number; toProcess: number; toShip: number; codToCollect: number }>([
+      { $match: { status: { $in: ['PENDING_PAYMENT', 'CONFIRMED', 'PROCESSING', 'DELIVERED'] } } },
+      { $group: {
+        _id: null,
+        awaitingPayment: { $sum: { $cond: [{ $eq: ['$status', 'PENDING_PAYMENT'] }, 1, 0] } },
+        toProcess: { $sum: { $cond: [{ $eq: ['$status', 'CONFIRMED'] }, 1, 0] } },
+        toShip: { $sum: { $cond: [{ $eq: ['$status', 'PROCESSING'] }, 1, 0] } },
+        codToCollect: { $sum: { $cond: [{ $and: [{ $eq: ['$status', 'DELIVERED'] }, { $eq: ['$paymentMethod', 'COD'] }, { $ne: ['$paymentStatus', 'PAID'] }] }, 1, 0] } },
+      } },
+      { $project: { _id: 0 } },
+    ]),
   ])
 
-  const totalSales = sales[0]?.total ?? 0
-  const paidOrders = sales[0]?.count ?? 0
+  // Without a range, the chart starts at the first order rather than at 1970.
+  const firstLabel = series[0]?.label
+  const seriesStart = hasRange ? from : firstLabel ? new Date(`${firstLabel.length === 7 ? `${firstLabel}-01` : firstLabel}T00:00:00+05:30`) : null
+  const byLabel = new Map(series.map((point) => [point.label, point]))
+  const revenueSeries = seriesStart ? periodKeys(seriesStart, to, unit).map((label) => byLabel.get(label) ?? { label, value: 0, booked: 0, orders: 0 }) : []
+
   sendSuccess(response, {
-    totalSales,
-    totalOrders,
-    paidOrders,
+    ...current,
     totalCustomers,
-    newCustomers,
     pendingOrders,
     totalProducts,
     outOfStockProducts,
     lowStockProducts,
-    // Average over paid orders, since only paid orders contribute to sales.
-    averageOrderValue: paidOrders ? Math.round((totalSales / paidOrders) * 100) / 100 : 0,
+    lowStockThreshold,
+    previous,
+    seriesUnit: unit,
     revenueSeries,
     topProducts,
     ordersByStatus,
+    paymentMethods,
+    needsAttention: attention[0] ?? { awaitingPayment: 0, toProcess: 0, toShip: 0, codToCollect: 0 },
+    recentOrders: recentOrders.map((order) => ({
+      _id: order._id,
+      orderNumber: order.orderNumber,
+      customerName: order.shippingAddress?.name ?? '',
+      itemCount: order.items.reduce((sum, item) => sum + item.quantity, 0),
+      total: order.total,
+      status: order.status,
+      paymentStatus: order.paymentStatus,
+      paymentMethod: order.paymentMethod,
+      createdAt: order.createdAt,
+    })),
+    lowStockItems: lowStockItems.map((product) => ({
+      _id: product._id,
+      name: product.name,
+      sku: product.sku,
+      stock: product.stock,
+      image: product.thumbnailImage || product.images?.[0] || '',
+    })),
   })
 }))
 

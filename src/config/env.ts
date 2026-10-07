@@ -16,6 +16,8 @@ const envSchema = z.object({
   JWT_ACCESS_EXPIRES_IN: z.string().default('15m'),
   JWT_REFRESH_EXPIRES_IN: z.string().default('7d'),
   COOKIE_DOMAIN: optionalString,
+  /** `none` lets the storefront and API live on different sites (e.g. vercel.app + another host); requires HTTPS. */
+  COOKIE_SAMESITE: z.preprocess((value) => (value === '' ? undefined : value), z.enum(['lax', 'strict', 'none']).optional()),
   RAZORPAY_KEY_ID: optionalString,
   RAZORPAY_KEY_SECRET: optionalString,
   RAZORPAY_WEBHOOK_SECRET: optionalString,

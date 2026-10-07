@@ -9,10 +9,16 @@ import { refreshTokenTtlMs, signAccessToken, signRefreshToken, verifyRefreshToke
 
 export const refreshCookieName = 'candley_refresh_token'
 
+/** Header the client uses to send a refresh token it kept in localStorage (when cookies are blocked cross-site). */
+export const refreshHeaderName = 'x-refresh-token'
+
+// Production defaults to SameSite=None so a storefront on another site (e.g. *.vercel.app) still sends the cookie.
+const sameSite = () => env.COOKIE_SAMESITE ?? (isProduction ? 'none' : 'lax')
+
 const cookieOptions = (): CookieOptions => ({
   httpOnly: true,
-  secure: isProduction,
-  sameSite: 'lax',
+  secure: isProduction || sameSite() === 'none',
+  sameSite: sameSite(),
   domain: env.COOKIE_DOMAIN || undefined,
   path: '/',
 })
@@ -41,11 +47,18 @@ export const issueSession = async (response: Response, user: UserDocument) => {
   const refreshToken = signRefreshToken({ sub: user.id, jti: tokenId })
   await RefreshToken.create({ userId: user.id, tokenId, expiresAt: new Date(Date.now() + ttl()) })
   response.cookie(refreshCookieName, refreshToken, { ...cookieOptions(), maxAge: ttl() })
-  return { accessToken, user: toPublicUser(user) }
+  // Also returned in the body so the client can keep it in localStorage as a fallback for blocked cookies.
+  return { accessToken, refreshToken, user: toPublicUser(user) }
+}
+
+/** The refresh token from the httpOnly cookie, or from the localStorage fallback header. */
+const refreshTokenFrom = (request: Request): string | undefined => {
+  const header = request.get(refreshHeaderName)
+  return request.cookies?.[refreshCookieName] || (header && header.length < 2048 ? header : undefined)
 }
 
 export const rotateSession = async (request: Request, response: Response) => {
-  const token = request.cookies?.[refreshCookieName]
+  const token = refreshTokenFrom(request)
   if (!token) throw new ApiError(401, 'Refresh token required')
   let claims
   try {
@@ -70,7 +83,7 @@ export const rotateSession = async (request: Request, response: Response) => {
 }
 
 export const endSession = async (request: Request, response: Response) => {
-  const token = request.cookies?.[refreshCookieName]
+  const token = refreshTokenFrom(request)
   if (token) {
     try {
       const claims = verifyRefreshToken(token)

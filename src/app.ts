@@ -37,7 +37,7 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Refresh-Token'],
   exposedHeaders: ['X-Total-Count', 'X-Total-Pages'],
 }))
 app.use(pinoHttp({ logger, autoLogging: { ignore: (request) => request.url === '/health' || request.url === '/live' } }))

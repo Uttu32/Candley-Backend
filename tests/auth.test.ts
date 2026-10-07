@@ -109,6 +109,17 @@ describe('sessions', () => {
     expect(await RefreshToken.countDocuments({ userId: user.id })).toBe(0)
   })
 
+  it('restores a session from the localStorage fallback header when no cookie is sent', async () => {
+    const { cookie } = await loginAs()
+    const token = refreshCookieFrom(cookie).split('=')[1]!
+    const restored = await api().post('/api/v1/auth/refresh').set('X-Refresh-Token', token)
+    expect(restored.status).toBe(200)
+    expect(restored.body.data.accessToken).toBeTruthy()
+    expect(restored.body.data.refreshToken).toBeTruthy()
+    // The old token was rotated away, so replaying it fails.
+    expect((await api().post('/api/v1/auth/refresh').set('X-Refresh-Token', token)).status).toBe(401)
+  })
+
   it('logout revokes the refresh token', async () => {
     const { cookie } = await loginAs()
     const refresh = refreshCookieFrom(cookie)

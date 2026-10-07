@@ -6,6 +6,9 @@ const skip = () => env.NODE_ENV === 'test'
 
 export const globalLimiter = rateLimit({ windowMs: 60_000, limit: 250, standardHeaders: 'draft-7', legacyHeaders: false, skip, message: message('Too many requests, please slow down') })
 
+/** Session restores happen on every page load, so they get a roomier budget than credential attempts. */
+export const refreshLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 300, standardHeaders: 'draft-7', legacyHeaders: false, skip, message: message('Too many requests, please slow down') })
+
 /** Login, registration and password-reset attempts per IP. */
 export const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false, skip, message: message('Too many attempts, please try again later') })
 

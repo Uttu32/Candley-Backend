@@ -8,7 +8,7 @@ import { ApiError } from '../utils/api-error.js'
 import { sendSuccess } from '../utils/response.js'
 import { createOpaqueToken, hashOpaqueToken } from '../utils/tokens.js'
 import { authenticate } from '../middlewares/auth.js'
-import { authLimiter } from '../middlewares/rate-limit.js'
+import { authLimiter, refreshLimiter } from '../middlewares/rate-limit.js'
 import { endSession, issueSession, revokeAllSessions, rotateSession, verifyCredentials } from '../services/session.service.js'
 import { mailTemplates, queueMail } from '../services/mailer.js'
 
@@ -49,7 +49,7 @@ authRouter.post('/login', authLimiter, asyncHandler(async (request, response) =>
   sendSuccess(response, session, 'Signed in')
 }))
 
-authRouter.post('/refresh', authLimiter, asyncHandler(async (request, response) => {
+authRouter.post('/refresh', refreshLimiter, asyncHandler(async (request, response) => {
   sendSuccess(response, await rotateSession(request, response), 'Token refreshed')
 }))
 
